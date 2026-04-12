@@ -148,7 +148,6 @@ Common files that use this guard:
 - `src/page/explain/gacha/list.tsx`
 - `src/page/explain/gacha/rate.tsx`
 - `src/page/explain/membership/membership.tsx`
-- `src/page/news/extra_source.tsx`
 
 ## Key Environment Variables
 | Variable | Description |
