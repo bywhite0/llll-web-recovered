@@ -8,6 +8,9 @@ const API_KEY = '4e769efa67d8f54be0b67e8f70ccb23d513a3c841191b6b2ba45ffc6fb49806
 const DEFAULT_RES_VERSION = 'R2604002';
 const DEFAULT_CLIENT_VERSION = '5.0.1';
 const DEFAULT_LOGIN_TYPE = 'android';
+const APPLE_APP_ID = '1665027261';
+const APPLE_BUNDLE_ID = 'com.oddno.lovelive';
+const APPLE_LOOKUP_URL = `https://itunes.apple.com/lookup?id=${APPLE_APP_ID}&country=jp`;
 const APP_STORE_URL = 'https://apps.apple.com/jp/app/link-like-love-live/id1665027261';
 const PLAY_STORE_URL = 'https://play.google.com/store/apps/details?id=com.oddno.lovelive&hl=en';
 
@@ -59,6 +62,7 @@ Options:
   --use-session-token               Shortcut for --auth-mode session
   --session-token <token>           Session token for session mode (or SESSION_TOKEN / config credential.session_token)
   --device-specific-id <id>         Device ID for session mode (or DEVICE_SPECIFIC_ID / config credential.device_specific_id)
+  --self-test-client-version-parser Run client version parser self-test
   --help                            Show this help
 `);
 }
@@ -127,9 +131,96 @@ function stripResourceVersionSuffix(value) {
   return String(value || '').split('@')[0].trim();
 }
 
-function extractSemver(text) {
-  const match = String(text || '').match(/\b\d+\.\d+\.\d+\b/);
-  return match ? match[0] : '';
+const SEMVER_RE = /\b\d+\.\d+\.\d+\b/;
+
+function isLikelyClientVersion(value) {
+  const match = String(value || '').trim().match(/^(\d+)\.(\d+)\.(\d+)$/);
+  if (!match) return false;
+  const [, major, minor, patch] = match.map(Number);
+  return major >= 1 && major <= 99 && minor <= 99 && patch <= 99;
+}
+
+function decodeHtmlEntities(value) {
+  return String(value || '')
+    .replace(/&quot;/g, '"')
+    .replace(/&#34;/g, '"')
+    .replace(/&#x22;/gi, '"')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>');
+}
+
+function firstLikelyVersion(candidates) {
+  for (const candidate of candidates) {
+    const match = String(candidate || '').match(SEMVER_RE);
+    if (match && isLikelyClientVersion(match[0])) return match[0];
+  }
+  return '';
+}
+
+function collectJsonValues(value, keys, out = []) {
+  if (Array.isArray(value)) {
+    for (const item of value) collectJsonValues(item, keys, out);
+    return out;
+  }
+  if (!value || typeof value !== 'object') return out;
+  for (const [key, item] of Object.entries(value)) {
+    if (keys.has(key) && typeof item === 'string') out.push(item);
+    collectJsonValues(item, keys, out);
+  }
+  return out;
+}
+
+function extractVersionsFromJsonLd(html, keys) {
+  const versions = [];
+  const scriptRe = /<script\b[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+  for (const match of String(html || '').matchAll(scriptRe)) {
+    const parsed = safeJsonParse(decodeHtmlEntities(match[1]).trim());
+    if (parsed.ok) versions.push(...collectJsonValues(parsed.value, keys));
+  }
+  return versions;
+}
+
+function extractContextualVersion(text, labels) {
+  const normalized = decodeHtmlEntities(String(text || '').replace(/<[^>]+>/g, ' '));
+  const labelPattern = labels.map((label) => label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+  const afterLabelRe = new RegExp(`(?:${labelPattern})[^\\d]{0,120}(\\d+\\.\\d+\\.\\d+)`, 'iu');
+  const afterLabel = normalized.match(afterLabelRe);
+  if (afterLabel && isLikelyClientVersion(afterLabel[1])) return afterLabel[1];
+
+  const beforeLabelRe = new RegExp(`(\\d+\\.\\d+\\.\\d+)[^\\d]{0,120}(?:${labelPattern})`, 'iu');
+  const beforeLabel = normalized.match(beforeLabelRe);
+  if (beforeLabel && isLikelyClientVersion(beforeLabel[1])) return beforeLabel[1];
+  return '';
+}
+
+function extractAppleLookupVersion(payload) {
+  const parsed = typeof payload === 'string' ? safeJsonParse(payload) : { ok: true, value: payload };
+  if (!parsed.ok || !parsed.value || typeof parsed.value !== 'object') return '';
+
+  const [result] = Array.isArray(parsed.value.results) ? parsed.value.results : [];
+  if (!result || typeof result !== 'object') return '';
+  if (typeof result.bundleId === 'string' && result.bundleId !== APPLE_BUNDLE_ID) return '';
+  if (typeof result.version !== 'string') return '';
+  return isLikelyClientVersion(result.version) ? result.version : '';
+}
+
+function extractAppStoreVersion(html) {
+  const text = String(html || '');
+  return firstLikelyVersion([
+    ...extractVersionsFromJsonLd(text, new Set(['softwareVersion'])),
+    ...[...text.matchAll(/["'](?:softwareVersion|versionString|appVersion|latestVersion)["']\s*:\s*["']([^"']+)["']/gi)].map((m) => m[1]),
+    extractContextualVersion(text, ['softwareVersion', 'versionString', 'appVersion', 'Version', 'バージョン']),
+  ]);
+}
+
+function extractGooglePlayVersion(html) {
+  const text = String(html || '');
+  return firstLikelyVersion([
+    ...extractVersionsFromJsonLd(text, new Set(['softwareVersion'])),
+    ...[...text.matchAll(/["'](?:softwareVersion|versionString|appVersion|currentVersion|latestVersion)["']\s*:\s*["']([^"']+)["']/gi)].map((m) => m[1]),
+    extractContextualVersion(text, ['softwareVersion', 'Current Version', 'Version', 'バージョン']),
+  ]);
 }
 
 async function fetchText(url) {
@@ -147,15 +238,31 @@ async function fetchText(url) {
   return res.text();
 }
 
+async function fetchJsonText(url) {
+  const res = await fetch(url, {
+    method: 'GET',
+    headers: {
+      accept: 'application/json',
+      'user-agent': 'Mozilla/5.0',
+    },
+    signal: AbortSignal.timeout(30000),
+  });
+  if (!res.ok) {
+    throw new Error(`GET ${url} failed: status=${res.status}`);
+  }
+  return res.text();
+}
+
 async function fetchLatestClientVersion() {
   const attempts = [
-    { source: 'App Store', url: APP_STORE_URL },
-    { source: 'Google Play', url: PLAY_STORE_URL },
+    { source: 'Apple lookup API', url: APPLE_LOOKUP_URL, fetch: fetchJsonText, parse: extractAppleLookupVersion },
+    { source: 'App Store HTML', url: APP_STORE_URL, fetch: fetchText, parse: extractAppStoreVersion },
+    { source: 'Google Play HTML', url: PLAY_STORE_URL, fetch: fetchText, parse: extractGooglePlayVersion },
   ];
   const errors = [];
   for (const attempt of attempts) {
     try {
-      const version = extractSemver(await fetchText(attempt.url));
+      const version = attempt.parse(await attempt.fetch(attempt.url));
       if (version) return { version, source: attempt.source };
       errors.push(`${attempt.source}: version not found`);
     } catch (error) {
@@ -236,6 +343,50 @@ function buildApiHeaders({ resVersion, clientVersion, loginType, deviceSpecificI
   if (sessionToken) headers.authorization = `Bearer ${sessionToken}`;
   if (withIdempotency) headers['x-idempotency-key'] = randomIdempotencyKey();
   return headers;
+}
+
+function runClientVersionParserSelfTest() {
+  const appleLookupFixture = JSON.stringify({
+    resultCount: 1,
+    results: [{
+      bundleId: APPLE_BUNDLE_ID,
+      version: '5.1.0',
+      currentVersionReleaseDate: '2026-04-30T00:00:00Z',
+      trackViewUrl: 'https://apps.apple.com/jp/app/link-like-love-live/id1665027261?uo=4&build=2618.5.0',
+    }],
+  });
+  const unrelatedAppleLookupFixture = JSON.stringify({
+    resultCount: 1,
+    results: [{
+      bundleId: 'com.example.unrelated',
+      version: '9.9.9',
+      releaseNotes: 'Do not pick 5.1.0 or 2618.5.0 from unrelated text.',
+    }],
+  });
+  const appStoreFixture = `
+    <script src="/assets/storefront-2618.5.0.js"></script>
+    <script type="application/ld+json">{"@type":"SoftwareApplication","softwareVersion":"6.2.3"}</script>
+  `;
+  const googlePlayFixture = `
+    <script>AF_initDataCallback({data:["2618.5.0",["Current Version","7.8.9"]]});</script>
+    <div>Current Version</div><span>7.8.9</span>
+  `;
+  const cases = [
+    ['Apple lookup uses results[0].version', extractAppleLookupVersion(appleLookupFixture), '5.1.0'],
+    ['Apple lookup ignores unrelated bundle semvers', extractAppleLookupVersion(unrelatedAppleLookupFixture), ''],
+    ['App Store metadata beats asset version', extractAppStoreVersion(appStoreFixture), '6.2.3'],
+    ['Google Play context beats asset version', extractGooglePlayVersion(googlePlayFixture), '7.8.9'],
+    ['Unrelated semver is ignored', extractAppStoreVersion('<script src="2618.5.0.js"></script>'), ''],
+  ];
+  const failed = cases.filter(([, actual, expected]) => actual !== expected);
+  if (failed.length) {
+    for (const [name, actual, expected] of failed) {
+      console.error(`FAIL ${name}: expected ${expected || '(empty)'}, got ${actual || '(empty)'}`);
+    }
+    process.exitCode = 1;
+    return;
+  }
+  console.log(`Client version parser self-test passed (${cases.length} cases).`);
 }
 
 async function loginWithDeviceId({
@@ -523,6 +674,10 @@ async function main() {
   const args = parseArgs(process.argv);
   if (asBool(args.help) || asBool(args.h)) {
     printHelp();
+    return;
+  }
+  if (asBool(args['self-test-client-version-parser'])) {
+    runClientVersionParserSelfTest();
     return;
   }
 
