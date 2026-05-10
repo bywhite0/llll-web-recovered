@@ -8,6 +8,8 @@ const API_KEY = '4e769efa67d8f54be0b67e8f70ccb23d513a3c841191b6b2ba45ffc6fb49806
 const DEFAULT_RES_VERSION = 'R2604002';
 const DEFAULT_CLIENT_VERSION = '5.0.1';
 const DEFAULT_LOGIN_TYPE = 'android';
+const APP_STORE_URL = 'https://apps.apple.com/jp/app/link-like-love-live/id1665027261';
+const PLAY_STORE_URL = 'https://play.google.com/store/apps/details?id=com.oddno.lovelive&hl=en';
 
 function parseArgs(argv) {
   const out = {};
@@ -121,6 +123,102 @@ async function postJson(url, headers, body) {
   };
 }
 
+function stripResourceVersionSuffix(value) {
+  return String(value || '').split('@')[0].trim();
+}
+
+function extractSemver(text) {
+  const match = String(text || '').match(/\b\d+\.\d+\.\d+\b/);
+  return match ? match[0] : '';
+}
+
+async function fetchText(url) {
+  const res = await fetch(url, {
+    method: 'GET',
+    headers: {
+      accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'user-agent': 'Mozilla/5.0',
+    },
+    signal: AbortSignal.timeout(30000),
+  });
+  if (!res.ok) {
+    throw new Error(`GET ${url} failed: status=${res.status}`);
+  }
+  return res.text();
+}
+
+async function fetchLatestClientVersion() {
+  const attempts = [
+    { source: 'App Store', url: APP_STORE_URL },
+    { source: 'Google Play', url: PLAY_STORE_URL },
+  ];
+  const errors = [];
+  for (const attempt of attempts) {
+    try {
+      const version = extractSemver(await fetchText(attempt.url));
+      if (version) return { version, source: attempt.source };
+      errors.push(`${attempt.source}: version not found`);
+    } catch (error) {
+      errors.push(`${attempt.source}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  throw new Error(errors.join('; '));
+}
+
+async function fetchLatestResourceVersion({ clientVersion, loginType }) {
+  const headers = buildApiHeaders({
+    resVersion: DEFAULT_RES_VERSION,
+    clientVersion,
+    loginType,
+    withIdempotency: true,
+  });
+  const resp = await postJson(
+    `${API_BASE}/user/login`,
+    headers,
+    {
+      player_id: '',
+      device_specific_id: '',
+      version: 1,
+    },
+  );
+  const resVersion = stripResourceVersionSuffix(resp.headers['x-res-version']);
+  if (!resVersion) {
+    throw new Error(`resource version header not found: status=${resp.status}`);
+  }
+  return resVersion;
+}
+
+async function resolveRuntimeVersions({ args, cfg, loginType }) {
+  const explicitClientVersion = args['client-version'] || process.env.CLIENT_VERSION || '';
+  const explicitResVersion = args['res-version'] || process.env.RES_VERSION || '';
+  let clientVersion = String(explicitClientVersion || cfg.credential?.client_version || DEFAULT_CLIENT_VERSION);
+  let resVersion = String(explicitResVersion || cfg.credential?.res_version || DEFAULT_RES_VERSION);
+
+  if (!explicitClientVersion) {
+    try {
+      const latestClient = await fetchLatestClientVersion();
+      clientVersion = latestClient.version;
+      console.log(`Detected latest client version: ${clientVersion} (${latestClient.source})`);
+    } catch (error) {
+      console.warn(`Warning: could not detect latest client version; using configured/default value. ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  if (!explicitResVersion) {
+    try {
+      resVersion = await fetchLatestResourceVersion({ clientVersion, loginType });
+      console.log(`Detected latest resource version: ${resVersion}`);
+    } catch (error) {
+      console.warn(`Warning: could not detect latest resource version; using configured/default value. ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  return {
+    resVersion,
+    clientVersion,
+  };
+}
+
 function buildApiHeaders({ resVersion, clientVersion, loginType, deviceSpecificId, sessionToken, withIdempotency }) {
   const normalizedLoginType = String(loginType || 'android').toLowerCase() === 'ios' ? 'ios' : 'android';
   const uaPrefix = normalizedLoginType === 'ios' ? 'inspix-ios' : 'inspix-android';
@@ -138,6 +236,59 @@ function buildApiHeaders({ resVersion, clientVersion, loginType, deviceSpecificI
   if (sessionToken) headers.authorization = `Bearer ${sessionToken}`;
   if (withIdempotency) headers['x-idempotency-key'] = randomIdempotencyKey();
   return headers;
+}
+
+async function loginWithDeviceId({
+  playerId,
+  deviceSpecificId,
+  resVersion,
+  clientVersion,
+  loginType,
+  errorContext = 'logging in',
+}) {
+  const loginHeaders = buildApiHeaders({
+    resVersion,
+    clientVersion,
+    loginType,
+    deviceSpecificId,
+    withIdempotency: true,
+  });
+
+  const userLoginResp = await postJson(
+    `${API_BASE}/user/login`,
+    loginHeaders,
+    {
+      player_id: playerId,
+      device_specific_id: deviceSpecificId,
+      version: 1,
+    },
+  );
+  if (!userLoginResp.ok || !userLoginResp.json?.session_token) {
+    throw new Error(`user/login failed while ${errorContext}: status=${userLoginResp.status}.`);
+  }
+  return String(userLoginResp.json.session_token);
+}
+
+async function validateSessionToken({
+  sessionToken,
+  deviceSpecificId,
+  resVersion,
+  clientVersion,
+  loginType,
+}) {
+  const headers = buildApiHeaders({
+    resVersion,
+    clientVersion,
+    loginType,
+    deviceSpecificId,
+    sessionToken,
+    withIdempotency: true,
+  });
+  const resp = await postJson(`${API_BASE}/archive/get_home`, headers, {});
+  return {
+    ok: resp.ok,
+    status: resp.status,
+  };
 }
 
 function buildWebHeaders({ resVersion, clientVersion, loginType, deviceSpecificId, sessionToken, playerId }) {
@@ -293,10 +444,38 @@ async function resolveSessionAuth({
         'Provide --device-specific-id, set DEVICE_SPECIFIC_ID, or include credential.device_specific_id in config.',
       );
     }
+    const validation = await validateSessionToken({
+      sessionToken: sessionTokenInput,
+      deviceSpecificId: deviceSpecificIdInput,
+      resVersion,
+      clientVersion,
+      loginType,
+    });
+    if (validation.ok) {
+      return {
+        deviceSpecificId: deviceSpecificIdInput,
+        sessionToken: sessionTokenInput,
+        authSource: 'session-token',
+      };
+    }
+    if (!playerId) {
+      throw new Error(
+        `Session token validation failed: status=${validation.status}. ` +
+        'Provide player id and device specific id to refresh the session token.',
+      );
+    }
+    const refreshedSessionToken = await loginWithDeviceId({
+      playerId,
+      deviceSpecificId: deviceSpecificIdInput,
+      resVersion,
+      clientVersion,
+      loginType,
+      errorContext: 'refreshing session token',
+    });
     return {
       deviceSpecificId: deviceSpecificIdInput,
-      sessionToken: sessionTokenInput,
-      authSource: 'session-token',
+      sessionToken: refreshedSessionToken,
+      authSource: 'session-token-refreshed',
     };
   }
 
@@ -325,33 +504,17 @@ async function resolveSessionAuth({
   }
 
   const deviceSpecificId = String(connectResp.json.device_specific_id);
-  const loginHeaders = buildApiHeaders({
+  const sessionToken = await loginWithDeviceId({
+    playerId,
+    deviceSpecificId,
     resVersion,
     clientVersion,
     loginType,
-    deviceSpecificId,
-    withIdempotency: true,
   });
-
-  const userLoginResp = await postJson(
-    `${API_BASE}/user/login`,
-    loginHeaders,
-    {
-      player_id: playerId,
-      device_specific_id: deviceSpecificId,
-      version: 1,
-    },
-  );
-  if (!userLoginResp.ok || !userLoginResp.json?.session_token) {
-    throw new Error(
-      `user/login failed: status=${userLoginResp.status}. ` +
-      'If you already have a valid session token, retry with --use-session-token.',
-    );
-  }
 
   return {
     deviceSpecificId,
-    sessionToken: String(userLoginResp.json.session_token),
+    sessionToken,
     authSource: 'connect-login',
   };
 }
@@ -398,8 +561,7 @@ async function main() {
   const cfg = configExists ? JSON.parse(fs.readFileSync(configPath, 'utf8')) : {};
   const loginTypeRaw = String(args['login-type'] || process.env.LOGIN_TYPE || cfg.login_type || DEFAULT_LOGIN_TYPE).toLowerCase();
   const loginType = loginTypeRaw === 'ios' ? 'ios' : 'android';
-  const resVersion = String(args['res-version'] || process.env.RES_VERSION || cfg.credential?.res_version || DEFAULT_RES_VERSION);
-  const clientVersion = String(args['client-version'] || process.env.CLIENT_VERSION || cfg.credential?.client_version || DEFAULT_CLIENT_VERSION);
+  const { resVersion, clientVersion } = await resolveRuntimeVersions({ args, cfg, loginType });
   const configPlayerId = String(cfg.credential?.player_id || '');
   const configSessionToken = String(cfg.credential?.session_token || '');
   const configDeviceSpecificId = String(cfg.credential?.device_specific_id || '');
