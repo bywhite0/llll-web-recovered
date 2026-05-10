@@ -76,7 +76,7 @@ pnpm run preview
 Notes:
 - `pnpm run dev` requires both `reports/api_content_*` and `reports/api_overlay/select-card-list-index.json`.
 - If you do not use a config file, `fetch:api-content` falls back to built-in header defaults unless overridden.
-- `pnpm run build` writes output to `dist-vite/`.
+- `pnpm run build` writes output to `dist/`.
 - `pnpm run preview` serves the built output locally.
 - You can find the related masterdata on [link-like-diff](https://github.com/vertesan/link-like-diff).
 
@@ -173,3 +173,7 @@ Common files that use this guard:
 
 ## Special Thanks
 - [linkura-cli](https://github.com/ChocoLZS/linkura-cli)
+
+## License
+
+MIT
