@@ -134,20 +134,44 @@ Prepare them before running dev:
 2. Build select-card index to generate `reports/api_overlay/select-card-list-index.json`.
 
 ## White Screen Fix for Session-Gated Pages
-Some pages return early when no valid `session` cookie exists, which can appear as a blank/white page in local dev.
+Some pages return early when no valid `session` cookie exists, which can appear as a blank/white page in local dev:
 
-For local debugging, comment out this block in the relevant page files:
 ```ts
 if (session === undefined || Object.keys(session).length === 0) {
   return;
 }
 ```
 
-Common files that use this guard:
+`pnpm run dev` and `pnpm run preview` handle this automatically. A local-only Vite plugin in
+`vite.config.ts` (`localSessionCookiePlugin`) sets a dummy `session={"local":"1"}` cookie on HTML
+navigations that do not already carry one. The local API overlay does not verify auth, so the
+snapshot-backed pages render without a real login.
+
+- Scope: only the Vite dev/preview servers. Nothing is added to the production bundle, and
+  `pnpm run serve:static` (mirrored original static site under `public/external/`) is unaffected.
+- Existing cookies are never overwritten, so a real session still takes priority.
+- To opt out, remove `localSessionCookiePlugin()` from the `plugins` array in `vite.config.ts`,
+  then comment out the guard above in the page files that use it.
+
+Files using this guard:
 - `src/page/contact/radio_mail.tsx`
 - `src/page/explain/gacha/list.tsx`
 - `src/page/explain/gacha/rate.tsx`
 - `src/page/explain/membership/membership.tsx`
+
+## Gacha Rate Pages (Provided Rates)
+`/explain/provided_gacha/:id` maps to `src/page/explain/gacha/rate.tsx` and renders the
+`提供割合` / `注意事項` tabs for one `gacha_series_id`. Card rates and the `ギフトボーナス`
+(drop gift) table both come from `/api/gacha/detail`, served locally from
+`reports/api_content_*/responses/api_gacha_detail_gacha_series_id_*.json`.
+
+- Any `gacha_series_id` present in the local snapshot works, e.g.
+  `/explain/provided_gacha/1050511`; unknown IDs return the overlay's `LOCAL_NOT_FOUND` and
+  render a blank page.
+- Gacha series flagged `giftless` (or `paidlimited`) have an empty `items` array, so the
+  gift table is omitted and the 注意事項 tab only carries the "no gift bonus" notice.
+- `/explain/provided_gacha_list/:type/:id` is a separate route that renders the exchange card
+  list from `/api/gacha/select_card_list`.
 
 ## Key Environment Variables
 | Variable | Description |

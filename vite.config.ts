@@ -167,8 +167,35 @@ function localApiOverlayPlugin() {
   };
 }
 
+// Local debugging helper: session-gated pages (gacha rate/list, membership, radio_mail)
+// bail out early when the `session` cookie is missing, which shows as a blank page in dev.
+// The local API overlay does not verify auth, so seed a dummy session object on HTML navigations.
+function localSessionCookiePlugin() {
+  const dummySession = 'session=' + encodeURIComponent(JSON.stringify({ local: '1' })) + '; Path=/; SameSite=Lax';
+
+  function middleware(req: any, res: any, next: () => void) {
+    const url: string = req.url ?? '/';
+    const acceptsHtml = String(req.headers?.accept ?? '').includes('text/html');
+    const hasSession = String(req.headers?.cookie ?? '').includes('session=');
+    if (acceptsHtml && !url.startsWith('/api/') && !hasSession) {
+      res.setHeader('Set-Cookie', dummySession);
+    }
+    next();
+  }
+
+  return {
+    name: 'local-session-cookie',
+    configureServer(server: any) {
+      server.middlewares.use(middleware);
+    },
+    configurePreviewServer(server: any) {
+      server.middlewares.use(middleware);
+    },
+  };
+}
+
 export default defineConfig({
-  plugins: [localApiOverlayPlugin(), pseudoStyleModulePlugin(), react()],
+  plugins: [localSessionCookiePlugin(), localApiOverlayPlugin(), pseudoStyleModulePlugin(), react()],
   build: {
     outDir: 'dist',
     emptyOutDir: true,
